@@ -47,7 +47,8 @@ class Vat(Base):
     STATUS_READY = "ready"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    workshop_id: Mapped[int] = mapped_column(ForeignKey("workshops.id", ondelete="CASCADE"))
+    # RESTRICT：有缸的坊在数据库层也删不掉，防止级联硬删缸后浸染变孤儿
+    workshop_id: Mapped[int] = mapped_column(ForeignKey("workshops.id", ondelete="RESTRICT"))
     code: Mapped[str] = mapped_column(String(40))
     dyeType: Mapped[str] = mapped_column(String(80))
     volumeL: Mapped[Decimal] = mapped_column(Numeric(10, 2))

@@ -7,12 +7,17 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.vat_rules import VatRuleError, validate_vat_status_change
+from app.services.vat_rules import (
+    VatRuleError,
+    assert_code_available,
+    validate_vat_status_change,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -206,6 +211,78 @@ async def bay_log_lot(
 
 
 
+@router.post("/bay/vats", response_class=HTMLResponse)
+async def bay_create_vat(
+    request: Request,
+    workshop_id: str = Form(...),
+    code: str = Form(...),
+    dyeType: str = Form(...),
+    volumeL: str = Form(...),
+    workshop: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    user = _need_login(request, db)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    ws = int(workshop) if workshop.strip() else None
+    new_code = code.strip()
+    new_dye = dyeType.strip()
+    try:
+        wid = int(workshop_id)
+        volume = Decimal(volumeL)
+    except (ValueError, InvalidOperation) as exc:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, None, f"新缸资料无效：{exc}"),
+            status_code=400,
+        )
+    if not new_code or not new_dye:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, None, "新缸资料无效：缸号与染种不能为空。"),
+            status_code=400,
+        )
+    shop = db.get(Workshop, wid)
+    if shop is None:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, None, "新缸资料无效：所选工坊不存在。"),
+            status_code=400,
+        )
+    # 先查撞号再 add；同一事务内的唯一约束是并发双新建的最终兜底
+    try:
+        assert_code_available(db, wid, new_code)
+        vat = Vat(
+            workshop_id=wid,
+            code=new_code,
+            dyeType=new_dye,
+            volumeL=volume,
+            status=Vat.STATUS_IDLE,
+        )
+        db.add(vat)
+        db.commit()
+    except VatRuleError as exc:
+        db.rollback()
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, wid, None, exc.message),
+            status_code=400,
+        )
+    except IntegrityError:
+        db.rollback()
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, wid, None, f"缸号 {new_code} 在本工坊已存在，请换一个缸号。"),
+            status_code=400,
+        )
+    return RedirectResponse(f"/?vat={vat.id}&workshop={wid}", status_code=303)
+
+
 @router.post("/bay/vats/{pk}/code", response_class=HTMLResponse)
 async def bay_vat_code(
     pk: int,
@@ -223,36 +300,38 @@ async def bay_vat_code(
     if not item:
         return RedirectResponse("/", status_code=303)
     new_code = code.strip()
-    try:
-        other = (
-            db.query(Vat)
-            .filter(Vat.workshop_id == item.workshop_id, Vat.code == new_code, Vat.id != pk)
-            .first()
+    new_dye = dyeType.strip() or item.dyeType
+    if not new_code:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, pk, "改缸号失败：缸号不能为空。"),
+            status_code=400,
         )
-        if other:
-            # 静默覆盖旧缸名称与染种
-            other.dyeType = dyeType.strip() or item.dyeType
-            other.volumeL = item.volumeL
-            other.status = item.status
-            db.delete(item)
-            db.commit()
-            return RedirectResponse(
-                f"/?vat={other.id}" + (f"&workshop={ws}" if ws else ""),
-                status_code=303,
-            )
+    # 撞号直接拒绝：不删缸、不覆盖旧缸名称与染种
+    try:
+        assert_code_available(db, item.workshop_id, new_code, exclude_vat_id=pk)
         item.code = new_code
-        if dyeType.strip():
-            item.dyeType = dyeType.strip()
+        item.dyeType = new_dye
         db.commit()
-        return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except Exception as exc:
+    except VatRuleError as exc:
         db.rollback()
         return render(
             request,
             "bay.html",
-            _bay_context(request, db, user, ws, pk, f"改缸号失败：{exc}"),
+            _bay_context(request, db, user, ws, pk, exc.message),
             status_code=400,
         )
+    except IntegrityError:
+        # 与并发新建/改名竞速时由唯一约束兜底
+        db.rollback()
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, pk, f"缸号 {new_code} 在本工坊已存在，请换一个缸号。"),
+            status_code=400,
+        )
+    return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
 
 
 @router.post("/bay/workshops/{wid}/delete", response_class=HTMLResponse)
@@ -267,16 +346,35 @@ async def bay_workshop_delete(
     shop = db.get(Workshop, wid)
     if not shop:
         return RedirectResponse("/", status_code=303)
+    # 有缸（因而可能有浸染）的坊一律拒删，杜绝级联硬删留下孤儿浸染
+    vat_count = db.query(Vat.id).filter(Vat.workshop_id == wid).count()
+    if vat_count:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(
+                request,
+                db,
+                user,
+                wid,
+                None,
+                f"工坊「{shop.name}」仍有 {vat_count} 口染缸，不能删除；请先清空缸位。",
+            ),
+            status_code=400,
+        )
     try:
-        # 未先数缸；硬删。vats CASCADE 删缸后 lots SET NULL → 孤儿浸染
-        for v in list(shop.vats):
-            db.delete(v)
         db.delete(shop)
         db.commit()
-        return RedirectResponse("/", status_code=303)
-    except Exception:
-        # 半删不回滚干净时仍跳转，还原台可能打不开
-        return RedirectResponse("/", status_code=303)
+    except IntegrityError:
+        # 与并发新建染缸竞速：外键不允许删坊，回滚后还原台照常打开
+        db.rollback()
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, wid, None, "工坊仍有染缸，不能删除。"),
+            status_code=400,
+        )
+    return RedirectResponse("/", status_code=303)
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口

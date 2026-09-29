@@ -35,7 +35,7 @@
         class="vat-card"
         :class="['st-' + v.status, { selected: selectedId === v.id }]"
         role="listitem"
-        @click="toggle(v.id)"
+        @click="creating = false; toggle(v.id)"
       >
         <div class="code" x-text="v.code"></div>
         <div class="meta" x-text="v.workshopName + ' · ' + v.dyeType"></div>
@@ -71,8 +71,42 @@
         </div>
       </button>
     </template>
+    <button
+      type="button"
+      class="vat-card vat-card-new"
+      role="listitem"
+      @click="creating = !creating; selectedId = null"
+    >
+      <div class="code">＋ 新缸</div>
+      <div class="meta">为本坊登记新缸号</div>
+    </button>
   </div>
-  <p class="empty-bay" x-show="filteredVats().length === 0" x-cloak>此工坊暂无染缸。</p>
+  <p class="empty-bay" x-show="filteredVats().length === 0 && !creating" x-cloak>此工坊暂无染缸。</p>
+
+  <div class="panel" x-show="creating" x-cloak x-transition>
+    <h2>新建染缸</h2>
+    <p class="hint">同工坊内缸号唯一；撞号会被拒绝，已有缸位资料不受影响。</p>
+    <form method="post" action="/bay/vats" class="create-vat-form">
+      <input type="hidden" name="workshop" :value="filterWs || ''">
+      <label>所属工坊
+        <select name="workshop_id" required x-model="newWorkshop">
+          <template x-for="w in workshops" :key="w.id">
+            <option :value="w.id" x-text="w.name"></option>
+          </template>
+        </select>
+      </label>
+      <label>缸号
+        <input type="text" name="code" required maxlength="40" placeholder="例如 V-03">
+      </label>
+      <label>染种
+        <input type="text" name="dyeType" required maxlength="80" placeholder="例如 土靛">
+      </label>
+      <label>容积 (L)
+        <input type="number" name="volumeL" step="0.01" min="0.01" required placeholder="例如 800">
+      </label>
+      <button type="submit">登记新缸</button>
+    </form>
+  </div>
 
   <div class="panel" x-show="selected()" x-cloak x-transition>
     <template x-if="selected()">
@@ -157,6 +191,8 @@
       vats: {{ vats | tojson }},
       filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
       selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      creating: false,
+      newWorkshop: null,
       init() {
         const params = new URLSearchParams(window.location.search);
         if (params.has('workshop') && this.filterWs === null) {
@@ -167,9 +203,12 @@
           const v = parseInt(params.get('vat'), 10);
           if (!isNaN(v)) this.selectedId = v;
         }
+        this.newWorkshop = this.filterWs || (this.workshops[0] && this.workshops[0].id) || null;
       },
       setFilter(id) {
         this.filterWs = id;
+        this.creating = false;
+        if (id !== null) this.newWorkshop = id;
         const still = this.filteredVats().some(v => v.id === this.selectedId);
         if (!still) this.selectedId = null;
         const url = new URL(window.location.href);
