@@ -8,7 +8,7 @@ services:
     ports:
       - "6650:5432"
     volumes:
-      - indigovat_bug07_pg:/var/lib/postgresql/data
+      - indigovat_5250_6650_pg:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U indigovat -d indigovat"]
       interval: 5s
@@ -32,4 +32,4 @@ services:
         condition: service_healthy
 
 volumes:
-  indigovat_bug07_pg:
+  indigovat_5250_6650_pg:

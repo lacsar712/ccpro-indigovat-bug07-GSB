@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
@@ -206,6 +207,96 @@ async def bay_log_lot(
 
 
 
+@router.post("/bay/vats", response_class=HTMLResponse)
+async def bay_vat_create(
+    request: Request,
+    workshop_id: str = Form(...),
+    code: str = Form(...),
+    dyeType: str = Form(...),
+    volumeL: str = Form(...),
+    status: str = Form(Vat.STATUS_IDLE),
+    db: Session = Depends(get_db),
+):
+    user = _need_login(request, db)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        wid = int(workshop_id)
+    except ValueError:
+        wid = -1
+    ws = wid if wid > 0 else None
+    new_code = code.strip()
+    new_dye = dyeType.strip()
+    try:
+        new_volume = Decimal(volumeL)
+    except InvalidOperation:
+        new_volume = None
+    if not db.get(Workshop, wid):
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, None, "开新缸失败：请选择有效工坊。"),
+            status_code=400,
+        )
+    if not new_code:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, None, "开新缸失败：缸号不能为空。"),
+            status_code=400,
+        )
+    if not new_dye or new_volume is None or new_volume <= 0:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, None, "开新缸失败：染种与正数容积必填。"),
+            status_code=400,
+        )
+    new_status = status if status in STATUS_LABELS else Vat.STATUS_IDLE
+    # 先查重给友好提示；唯一约束再兜住两人同时开同号的并发
+    clash = (
+        db.query(Vat)
+        .filter(Vat.workshop_id == wid, Vat.code == new_code)
+        .first()
+    )
+    if clash:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, clash.id, f"缸号 {new_code} 已存在，不能重复开缸。"),
+            status_code=400,
+        )
+    vat = Vat(
+        workshop_id=wid,
+        code=new_code,
+        dyeType=new_dye,
+        volumeL=new_volume,
+        status=new_status,
+    )
+    db.add(vat)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发：另一笔已抢先占用同坊同号，本笔拒绝且不入库
+        db.rollback()
+        winner = (
+            db.query(Vat)
+            .filter(Vat.workshop_id == wid, Vat.code == new_code)
+            .first()
+        )
+        return render(
+            request,
+            "bay.html",
+            _bay_context(
+                request, db, user, ws, winner.id if winner else None,
+                f"缸号 {new_code} 刚被他人先登记，本笔未入库。",
+            ),
+            status_code=409,
+        )
+    db.refresh(vat)
+    return RedirectResponse(f"/?vat={vat.id}&workshop={wid}", status_code=303)
+
+
 @router.post("/bay/vats/{pk}/code", response_class=HTMLResponse)
 async def bay_vat_code(
     pk: int,
@@ -223,36 +314,41 @@ async def bay_vat_code(
     if not item:
         return RedirectResponse("/", status_code=303)
     new_code = code.strip()
-    try:
-        other = (
-            db.query(Vat)
-            .filter(Vat.workshop_id == item.workshop_id, Vat.code == new_code, Vat.id != pk)
-            .first()
+    if not new_code:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, pk, "改缸号失败：缸号不能为空。"),
+            status_code=400,
         )
-        if other:
-            # 静默覆盖旧缸名称与染种
-            other.dyeType = dyeType.strip() or item.dyeType
-            other.volumeL = item.volumeL
-            other.status = item.status
-            db.delete(item)
-            db.commit()
-            return RedirectResponse(
-                f"/?vat={other.id}" + (f"&workshop={ws}" if ws else ""),
-                status_code=303,
-            )
-        item.code = new_code
-        if dyeType.strip():
-            item.dyeType = dyeType.strip()
+    # 撞号一律拒绝，绝不覆盖旧缸资料；同号即自身则视为无改动
+    other = (
+        db.query(Vat)
+        .filter(Vat.workshop_id == item.workshop_id, Vat.code == new_code, Vat.id != pk)
+        .first()
+    )
+    if other:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, pk, f"缸号 {new_code} 已被占用，旧缸资料保持不变。"),
+            status_code=400,
+        )
+    item.code = new_code
+    if dyeType.strip():
+        item.dyeType = dyeType.strip()
+    try:
         db.commit()
-        return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except Exception as exc:
+    except IntegrityError:
+        # 并发：改号期间同坊同号被他人抢先占用，回滚以保持本缸原样
         db.rollback()
         return render(
             request,
             "bay.html",
-            _bay_context(request, db, user, ws, pk, f"改缸号失败：{exc}"),
-            status_code=400,
+            _bay_context(request, db, user, ws, pk, f"缸号 {new_code} 刚被他人占用，本缸资料保持不变。"),
+            status_code=409,
         )
+    return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
 
 
 @router.post("/bay/workshops/{wid}/delete", response_class=HTMLResponse)
@@ -267,16 +363,30 @@ async def bay_workshop_delete(
     shop = db.get(Workshop, wid)
     if not shop:
         return RedirectResponse("/", status_code=303)
+    # 有缸的坊必须先清空染缸；拒绝硬删，避免缸被级联删除后浸染成孤儿
+    vat_count = db.query(Vat).filter(Vat.workshop_id == wid).count()
+    if vat_count:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(
+                request, db, user, wid, None,
+                f"工坊「{shop.name}」仍有 {vat_count} 口染缸，不能删除；请先清空缸位。",
+            ),
+            status_code=400,
+        )
     try:
-        # 未先数缸；硬删。vats CASCADE 删缸后 lots SET NULL → 孤儿浸染
-        for v in list(shop.vats):
-            db.delete(v)
         db.delete(shop)
         db.commit()
-        return RedirectResponse("/", status_code=303)
-    except Exception:
-        # 半删不回滚干净时仍跳转，还原台可能打不开
-        return RedirectResponse("/", status_code=303)
+    except Exception as exc:
+        db.rollback()
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, None, None, f"删除工坊失败：{exc}"),
+            status_code=400,
+        )
+    return RedirectResponse("/", status_code=303)
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口

@@ -28,6 +28,19 @@
   <div class="error-box">{{ error }}</div>
   {% endif %}
 
+  <form method="post" action="/bay/vats" class="new-vat">
+    <select name="workshop_id" required aria-label="工坊">
+      <option value="" disabled>选工坊</option>
+      {% for w in workshops %}
+      <option value="{{ w.id }}" {% if filter_workshop == w.id %}selected{% endif %}>{{ w.name }}</option>
+      {% endfor %}
+    </select>
+    <input type="text" name="code" required maxlength="40" placeholder="缸号，如 V-03">
+    <input type="text" name="dyeType" required maxlength="80" placeholder="染种，如 土靛">
+    <input type="number" name="volumeL" required step="0.01" min="0.01" placeholder="容积 L">
+    <button type="submit" class="chip">开新缸</button>
+  </form>
+
   <div class="bay-scroll" role="list">
     <template x-for="v in filteredVats()" :key="v.id">
       <button
