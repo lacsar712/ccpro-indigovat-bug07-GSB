@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: indigovat
+      POSTGRES_USER: indigovat
+      POSTGRES_PASSWORD: indigovat
+    ports:
+      - "6650:5432"
+    volumes:
+      - indigovat_bug07_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indigovat -d indigovat"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 90s
+
+  web:
+    build: .
+    ports:
+      - "5250:4720"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: indigovat
+      POSTGRES_USER: indigovat
+      POSTGRES_PASSWORD: indigovat
+      SESSION_SECRET: "dev-indigovat-bug07-session-secret"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  indigovat_bug07_pg:
